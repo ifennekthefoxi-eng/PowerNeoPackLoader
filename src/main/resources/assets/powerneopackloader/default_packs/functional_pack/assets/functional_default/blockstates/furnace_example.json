@@ -1,0 +1,8 @@
+{
+  "variants": {
+    "facing=north": { "model": "functional_default:block/furnace_example" },
+    "facing=east":  { "model": "functional_default:block/furnace_example", "y": 90 },
+    "facing=south": { "model": "functional_default:block/furnace_example", "y": 180 },
+    "facing=west":  { "model": "functional_default:block/furnace_example", "y": 270 }
+  }
+}

@@ -1,0 +1,24 @@
+modLoader = "javafml"
+loaderVersion = "[4,)"
+license = "MIT"
+
+[[mods]]
+modId = "powerneopackloader"
+version = "${file.jarVersion}"
+displayName = "Power Neo Pack Loader"
+authors = "fennek"
+description = '''A NeoForge library for loading isolated model, texture and collision packs.'''
+
+[[dependencies.powerneopackloader]]
+modId = "neoforge"
+type = "required"
+versionRange = "[21.1.219,)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.powerneopackloader]]
+modId = "minecraft"
+type = "required"
+versionRange = "[1.21.1]"
+ordering = "NONE"
+side = "BOTH"
