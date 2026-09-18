@@ -22,3 +22,15 @@ type = "required"
 versionRange = "[1.21.1]"
 ordering = "NONE"
 side = "BOTH"
+
+# Optional: only the GeckoLib example block (ExampleGeckoLibBlock and its supporting classes)
+# needs GeckoLib, and every reference to a GeckoLib class in this mod is now gated behind
+# GeckoLibCompat.LOADED (a ModList check), so the mod works fine without it - see GeckoLibCompat's
+# class doc. Adjust versionRange to match whatever GeckoLib version your build.gradle compiles
+# against.
+[[dependencies.powerneopackloader]]
+modId = "geckolib"
+type = "optional"
+versionRange = "[4.4,)"
+ordering = "AFTER"
+side = "BOTH"

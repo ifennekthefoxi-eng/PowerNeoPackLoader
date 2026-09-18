@@ -1,0 +1,10 @@
+{
+  "name": "example stairs",
+  "class": "LoadableModelHorizontalDirectionalBlock",
+  "properties": {
+    "strength": 1.5,
+    "explosion_resistance": 6.0,
+    "sound": "stone",
+    "requires_tool": true
+  }
+}

@@ -54,7 +54,6 @@ import org.apache.commons.io.filefilter.TrueFileFilter;
 
 public final class GetJarResources {
     private static final Instant BACKUP_TIME = Instant.parse("2024-02-26T12:28:08.000Z");
-    private static final Path BACKUP_PATH = Paths.get("config", "cacw", "backup");
     private static final SimpleDateFormat BACKUP_DATE_FORMAT = new SimpleDateFormat("yyyyMMdd-HHmmss");
     private static final int MAX_BACKUP_COUNT = 10;
     private static final String EXPORT_STATE_FILE_NAME = ".export-state.json";
@@ -92,6 +91,62 @@ public final class GetJarResources {
 
     public static void copyModDirectory(String srcPath, Path root, String path) {
         copyModDirectory(PowerNeoPackLoader.class, srcPath, root, path);
+    }
+
+    /**
+     * The names of the immediate subdirectories of a directory inside {@code resourceClass}'s own
+     * jar - used to discover every default pack a mod ships under
+     * {@code assets/<modId>/default_packs/} without the mod having to name them one by one.
+     * <p>
+     * Handles both layouts a mod's resources can have at runtime: a real directory (dev workspace,
+     * exploded resources) and a jar entry ({@code jar:} URL, production). In the jar case there is
+     * no directory listing to ask for, so the child names are derived from the entry paths
+     * themselves - and every entry is considered, not just the ones marked as directories, because
+     * some jars omit directory entries entirely and would otherwise appear empty.
+     *
+     * @return the subdirectory names, or an empty list if the path doesn't exist or can't be read -
+     *         a mod that ships no default packs is entirely normal, not an error.
+     */
+    public static List<String> listChildDirectories(Class<?> resourceClass, String srcPath) {
+        URL url = resourceClass.getResource(srcPath);
+        if (url == null) {
+            return List.of();
+        }
+
+        Set<String> names = new java.util.LinkedHashSet<>();
+        try {
+            if ("jar".equals(url.getProtocol())) {
+                JarURLConnection connection = (JarURLConnection) url.openConnection();
+                connection.setUseCaches(false);
+                String rootEntry = normalizeDirectoryEntryName(connection.getEntryName());
+                try (JarFile jarFile = connection.getJarFile()) {
+                    Enumeration<JarEntry> entries = jarFile.entries();
+                    while (entries.hasMoreElements()) {
+                        String name = entries.nextElement().getName();
+                        if (!name.startsWith(rootEntry) || name.length() <= rootEntry.length()) {
+                            continue;
+                        }
+                        String relative = name.substring(rootEntry.length());
+                        int slash = relative.indexOf('/');
+                        // Only entries that actually live under a subdirectory - a loose file
+                        // sitting directly in default_packs/ is not a pack.
+                        if (slash > 0) {
+                            names.add(relative.substring(0, slash));
+                        }
+                    }
+                }
+            } else {
+                Path root = resolveSourcePath(url);
+                try (Stream<Path> children = Files.list(root)) {
+                    children.filter(path -> Files.isDirectory(path, new LinkOption[0]))
+                            .forEach(path -> names.add(path.getFileName().toString()));
+                }
+            }
+        } catch (Exception e) {
+            PowerNeoPackLoader.LOGGER.warn("Failed to list default packs in {}: {}", srcPath, e.getMessage());
+        }
+
+        return new ArrayList<>(names);
     }
 
     @Nullable
@@ -302,7 +357,9 @@ public final class GetJarResources {
 
     private static void backupFiles(Path targetPath) throws IOException {
         String dirName = targetPath.getFileName().toString();
-        Path resourcePacksPath = FMLPaths.GAMEDIR.get().resolve("cacw_backup");
+        // Generic, not tied to any one consuming mod: every mod's default-pack backups land under
+        // the same top-level folder, each in its own subfolder named after the pack directory.
+        Path resourcePacksPath = FMLPaths.GAMEDIR.get().resolve("powerpackloader_backup");
         Path backupPath = resourcePacksPath.resolve(dirName);
         if (!Files.isDirectory(backupPath, new LinkOption[0])) {
             Files.createDirectories(backupPath);

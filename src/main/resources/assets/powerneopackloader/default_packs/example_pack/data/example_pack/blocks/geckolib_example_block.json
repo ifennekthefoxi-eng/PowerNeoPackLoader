@@ -1,0 +1,5 @@
+{
+  "name": "geckolib example block",
+  "class": "ExampleGeckoLibBlock",
+  "geckolib": true
+}

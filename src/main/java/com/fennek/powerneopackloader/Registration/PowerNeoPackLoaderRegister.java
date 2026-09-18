@@ -2,9 +2,12 @@ package com.fennek.powerneopackloader.Registration;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.fennek.powerneopackloader.APIBridge.PackBlockContext;
 import com.fennek.powerneopackloader.CoreComponentes.ClassPicker;
 import com.fennek.powerneopackloader.CoreComponentes.EntityPicker;
-import com.fennek.powerneopackloader.CoreComponentes.PowerPackLoaderRegistrationContext;
+import com.fennek.powerneopackloader.CoreComponentes.GeckoLibCompat;
+import com.fennek.powerneopackloader.CoreComponentes.ItemPicker;
+import com.fennek.powerneopackloader.CoreComponentes.PackBlockProperties;
 import com.fennek.powerneopackloader.PowerNeoPackLoader;
 import com.fennek.powerneopackloader.loadingPacks.PowerPackLoaderPacksLoader;
 import net.minecraft.core.BlockPos;
@@ -22,32 +25,53 @@ import net.neoforged.neoforge.registries.DeferredBlock;
 import net.neoforged.neoforge.registries.DeferredHolder;
 import net.neoforged.neoforge.registries.DeferredItem;
 import net.neoforged.neoforge.registries.DeferredRegister;
+import software.bernie.geckolib.animatable.GeoItem;
 
 import java.io.BufferedReader;
 import java.lang.reflect.Constructor;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
 
+/**
+ * Walks a loader's pack folders and turns every block json it finds into a real registered block,
+ * item and (when one is mapped) block entity type.
+ * <p>
+ * Everything mod-specific arrives as a parameter - the mod id to register under, the event bus to
+ * register on, and the three pickers saying which Java class each pack json's {@code "class"} field
+ * means - so nothing here is tied to any one mod. The pickers are normally filled automatically
+ * from {@code @PackBlock} and friends; see {@code PackAnnotationScanner}.
+ */
 public class PowerNeoPackLoaderRegister {
 
     /**
      * Every dynamically-created {@link BlockEntityType}'s registry id, mapped to whatever entity
      * class {@link EntityPicker} said it should be paired with (e.g. {@code ChestBlockEntity},
-     * {@code LoadableFurnaceBlockEntity}).
+     * a mod's own {@code EngineBlockEntity}).
      * <p>
      * This exists purely so client-side code (see {@code PowerPackLoaderClientEvents}) can decide,
-     * at {@code EntityRenderersEvent.RegisterRenderers} time, which vanilla
-     * {@code BlockEntityRenderer} (if any) belongs on each pack-generated type. Registering a
-     * {@code BlockEntityType} does NOT register a renderer for it - those are two entirely separate
-     * registries in vanilla, and nothing about the block/entity registration path above touches
-     * rendering at all. Populated synchronously while blocks are being registered (well before
-     * RegisterRenderers fires), so a plain static map is enough - no DeferredRegister needed here,
-     * this isn't a registry object itself.
+     * at {@code EntityRenderersEvent.RegisterRenderers} time, which {@code BlockEntityRenderer} (if
+     * any) belongs on each pack-generated type. Registering a {@code BlockEntityType} does NOT
+     * register a renderer for it - those are two entirely separate registries in vanilla, and
+     * nothing about the block/entity registration path below touches rendering at all. Populated
+     * synchronously while blocks are being registered (well before RegisterRenderers fires), so a
+     * plain static map is enough - no DeferredRegister needed here, this isn't a registry object
+     * itself.
+     * <p>
+     * Static and shared across mods deliberately: the renderer registration that consumes it runs
+     * once, in this library, for every pack block in the game. Keys are full ResourceLocations, so
+     * two mods can never collide.
+     * <p>
+     * Concurrent because FML constructs mods in PARALLEL, on several {@code modloading-worker}
+     * threads - so with two or more mods using this library, two constructors populate this map at
+     * the same time. A plain {@code HashMap} can lose entries or corrupt its internal table under
+     * concurrent writes; the symptom would be a pack block that registers correctly but
+     * intermittently renders as nothing, on some launches and not others. Everything else this
+     * library shares between mods is guarded for the same reason.
      */
-    public static final Map<ResourceLocation, Class<?>> REGISTERED_ENTITY_CLASSES = new HashMap<>();
+    public static final Map<ResourceLocation, Class<?>> REGISTERED_ENTITY_CLASSES = new ConcurrentHashMap<>();
 
     /**
      * Instantiates the mapped block entity class for a pack block, preferring a
@@ -68,184 +92,275 @@ public class PowerNeoPackLoaderRegister {
      * + {@code setAccessible} rather than {@code getConstructor}.
      */
     private static BlockEntity instantiateBlockEntity(Class<?> targetEntityClass, BlockEntityType<?> selfType, BlockPos pos, BlockState state) {
+        Constructor<?> selfAwareCtor = findConstructor(targetEntityClass, BlockEntityType.class, BlockPos.class, BlockState.class);
         try {
-            Constructor<?> selfAwareCtor = targetEntityClass.getDeclaredConstructor(BlockEntityType.class, BlockPos.class, BlockState.class);
-            selfAwareCtor.setAccessible(true);
-            return (BlockEntity) selfAwareCtor.newInstance(selfType, pos, state);
-        } catch (NoSuchMethodException noSelfAwareCtor) {
-            try {
-                return (BlockEntity) targetEntityClass.getConstructor(BlockPos.class, BlockState.class).newInstance(pos, state);
-            } catch (Exception e) {
-                throw new RuntimeException("Failed to instantiate block entity class: " + targetEntityClass.getName(), e);
+            if (selfAwareCtor != null) {
+                return (BlockEntity) selfAwareCtor.newInstance(selfType, pos, state);
             }
+            Constructor<?> plainCtor = findConstructor(targetEntityClass, BlockPos.class, BlockState.class);
+            if (plainCtor == null) {
+                throw new NoSuchMethodException("no (BlockEntityType, BlockPos, BlockState) or (BlockPos, BlockState) constructor");
+            }
+            return (BlockEntity) plainCtor.newInstance(pos, state);
         } catch (Exception e) {
             throw new RuntimeException("Failed to instantiate block entity class: " + targetEntityClass.getName(), e);
         }
     }
 
-    public static void RegisterBlocksFromPackLoader(PowerPackLoaderPacksLoader loader, ClassPicker classPicker, EntityPicker entityPicker, String Mod_ID, IEventBus modBus) {
-        Path rootFolder = loader.getRootFolder(); //[cite: 1]
+    /**
+     * A declared constructor with exactly {@code parameterTypes}, made accessible, or null if the
+     * class has no such constructor.
+     * <p>
+     * {@code getDeclaredConstructor} rather than {@code getConstructor} throughout, so a pack class
+     * doesn't have to make its constructor public just to be loadable - and returning null rather
+     * than throwing, because "this class uses a different one of the supported signatures" is the
+     * normal case here, not an error.
+     */
+    private static Constructor<?> findConstructor(Class<?> type, Class<?>... parameterTypes) {
+        try {
+            Constructor<?> ctor = type.getDeclaredConstructor(parameterTypes);
+            ctor.setAccessible(true);
+            return ctor;
+        } catch (NoSuchMethodException e) {
+            return null;
+        }
+    }
 
-        if (rootFolder == null || !Files.exists(rootFolder)) { //[cite: 1]
-            return; //[cite: 1]
+    /**
+     * Builds the block, trying each supported constructor shape in turn (see {@code @PackBlock}):
+     * {@code (Properties, PackBlockContext)}, then {@code (Properties)}, then {@code ()}.
+     * <p>
+     * The context is published to {@link PackBlockContext#current()} around the whole call
+     * regardless of which shape matched, so even a block using the plain vanilla
+     * {@code (Properties)} constructor can still read its own pack json - including from inside a
+     * {@code super(...)} argument, where no constructor parameter could be reached anyway.
+     */
+    private static Block instantiateBlock(Class<? extends Block> blockClass, BlockBehaviour.Properties properties,
+                                          PackBlockContext context) {
+        PackBlockContext.setCurrent(context);
+        try {
+            Constructor<?> withContext = findConstructor(blockClass, BlockBehaviour.Properties.class, PackBlockContext.class);
+            if (withContext != null) {
+                return (Block) withContext.newInstance(properties, context);
+            }
+            Constructor<?> withProperties = findConstructor(blockClass, BlockBehaviour.Properties.class);
+            if (withProperties != null) {
+                return (Block) withProperties.newInstance(properties);
+            }
+            Constructor<?> noArgs = findConstructor(blockClass);
+            if (noArgs != null) {
+                return (Block) noArgs.newInstance();
+            }
+            throw new NoSuchMethodException("no (Properties, PackBlockContext), (Properties) or () constructor");
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to instantiate block class: " + blockClass.getName(), e);
+        } finally {
+            PackBlockContext.clearCurrent();
+        }
+    }
+
+    /**
+     * Builds the pack block's item: the {@link ItemPicker}-mapped class if there is one - trying
+     * {@code (Block, Item.Properties, PackBlockContext)} then {@code (Block, Item.Properties)} -
+     * and a plain vanilla {@link BlockItem} otherwise, which is correct for the great majority of
+     * pack blocks.
+     */
+    private static BlockItem instantiateItem(Class<?> itemClass, Block block, PackBlockContext context) {
+        if (itemClass == null) {
+            return new BlockItem(block, new Item.Properties());
         }
 
-        DeferredRegister.Blocks BLOCKS = DeferredRegister.createBlocks(Mod_ID); //[cite: 1]
-        DeferredRegister.Items ITEMS = DeferredRegister.createItems(Mod_ID); //[cite: 1]
-        // 1. Added DeferredRegister for Block Entities
+        PackBlockContext.setCurrent(context);
+        try {
+            Constructor<?> withContext = findConstructor(itemClass, Block.class, Item.Properties.class, PackBlockContext.class);
+            if (withContext != null) {
+                return (BlockItem) withContext.newInstance(block, new Item.Properties(), context);
+            }
+            Constructor<?> plain = findConstructor(itemClass, Block.class, Item.Properties.class);
+            if (plain != null) {
+                return (BlockItem) plain.newInstance(block, new Item.Properties());
+            }
+            throw new NoSuchMethodException("no (Block, Item.Properties, PackBlockContext) or (Block, Item.Properties) constructor");
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to instantiate item class: " + itemClass.getName(), e);
+        } finally {
+            PackBlockContext.clearCurrent();
+        }
+    }
+
+    public static void RegisterBlocksFromPackLoader(PowerPackLoaderPacksLoader loader, ClassPicker classPicker, EntityPicker entityPicker, ItemPicker itemPicker, String Mod_ID, IEventBus modBus) {
+        Path rootFolder = loader.getRootFolder();
+
+        if (rootFolder == null || !Files.exists(rootFolder)) {
+            return;
+        }
+
+        DeferredRegister.Blocks BLOCKS = DeferredRegister.createBlocks(Mod_ID);
+        DeferredRegister.Items ITEMS = DeferredRegister.createItems(Mod_ID);
         DeferredRegister<BlockEntityType<?>> BLOCK_ENTITIES = DeferredRegister.create(Registries.BLOCK_ENTITY_TYPE, Mod_ID);
 
-        com.fennek.powerneopackloader.Registration.PowerPackLoaderModelGenerator.clear(loader); //[cite: 1]
-        loader.clearPackItems(); //[cite: 1]
+        PowerPackLoaderModelGenerator.clear(loader);
+        loader.clearPackItems();
 
-        try (Stream<Path> stream = Files.list(rootFolder)) { //[cite: 1]
-            stream.filter(Files::isDirectory) //[cite: 1]
-                    .forEach(packFolder -> { //[cite: 1]
-                        Path metaFile = packFolder.resolve(loader.getMetaFile()); //[cite: 1]
+        try (Stream<Path> stream = Files.list(rootFolder)) {
+            stream.filter(Files::isDirectory)
+                    .forEach(packFolder -> {
+                        Path metaFile = packFolder.resolve(loader.getMetaFile());
 
-                        if (Files.exists(metaFile) && Files.isRegularFile(metaFile)) { //[cite: 1]
+                        if (Files.exists(metaFile) && Files.isRegularFile(metaFile)) {
 
-                            try (BufferedReader metaReader = Files.newBufferedReader(metaFile)) { //[cite: 1]
-                                JsonObject metaJson = JsonParser.parseReader(metaReader).getAsJsonObject(); //[cite: 1]
+                            try (BufferedReader metaReader = Files.newBufferedReader(metaFile)) {
+                                JsonObject metaJson = JsonParser.parseReader(metaReader).getAsJsonObject();
 
-                                if (metaJson.has("id")) { //[cite: 1]
-                                    String packId = metaJson.get("id").getAsString(); //[cite: 1]
+                                if (metaJson.has("id")) {
+                                    String packId = metaJson.get("id").getAsString();
 
-                                    com.fennek.powerneopackloader.Registration.PowerPackLoaderLangGenerator.generate( //[cite: 1]
-                                            loader, packFolder, packId); //[cite: 1]
+                                    PowerPackLoaderLangGenerator.generate(loader, packFolder, packId);
+                                    PowerPackLoaderRegistry.clearPack(Mod_ID, packId);
 
-                                    Path blocksFolder = packFolder.resolve("data").resolve(packId).resolve("blocks"); //[cite: 1]
+                                    Path blocksFolder = packFolder.resolve("data").resolve(packId).resolve("blocks");
 
-                                    if (Files.exists(blocksFolder) && Files.isDirectory(blocksFolder)) { //[cite: 1]
+                                    if (Files.exists(blocksFolder) && Files.isDirectory(blocksFolder)) {
 
-                                        try (Stream<Path> blockFilesStream = Files.list(blocksFolder)) { //[cite: 1]
+                                        try (Stream<Path> blockFilesStream = Files.list(blocksFolder)) {
                                             blockFilesStream
-                                                    .filter(Files::isRegularFile) //[cite: 1]
-                                                    .filter(path -> path.toString().endsWith(".json")) //[cite: 1]
-                                                    .forEach(blockFile -> { //[cite: 1]
-
-                                                        try (BufferedReader blockReader = Files.newBufferedReader(blockFile)) { //[cite: 1]
-                                                            JsonObject blockJson = JsonParser.parseReader(blockReader).getAsJsonObject(); //[cite: 1]
-
-                                                            if (blockJson.has("class")) { //[cite: 1]
-                                                                String fileName = blockFile.getFileName().toString(); //[cite: 1]
-                                                                String blockId = fileName.endsWith(".json") //[cite: 1]
-                                                                        ? fileName.substring(0, fileName.length() - ".json".length()) //[cite: 1]
-                                                                        : fileName; //[cite: 1]
-                                                                String displayName = blockJson.has("name") //[cite: 1]
-                                                                        ? blockJson.get("name").getAsString() //[cite: 1]
-                                                                        : blockId; //[cite: 1]
-                                                                String blockNameIdFormated = packId + "_" + blockId; //[cite: 1]
-                                                                String blockClass = blockJson.get("class").getAsString(); //[cite: 1]
-
-                                                                PowerNeoPackLoader.LOGGER.warn("Successfully read block! File: " + blockFile.getFileName() + " | Class: " + blockClass); //[cite: 1]
-
-                                                                Class<?> actualBlockClass = classPicker.getClassById(blockClass); //[cite: 1]
-
-                                                                if (actualBlockClass != null && Block.class.isAssignableFrom(actualBlockClass)) { //[cite: 1]
-
-                                                                    @SuppressWarnings("unchecked")
-                                                                    Class<? extends Block> targetBlockClass = (Class<? extends Block>) actualBlockClass; //[cite: 1]
-
-                                                                    // 2. Query the EntityPicker for a mapped entity class using your exact typo-method
-                                                                    Class<?> targetEntityClass = entityPicker.getEnityByBlockClass(targetBlockClass); //[cite: 2]
-
-                                                                    com.fennek.powerneopackloader.Registration.PowerPackLoaderModelGenerator.generate( //[cite: 1]
-                                                                            loader, Mod_ID, packFolder, packId, blockId, blockNameIdFormated, targetBlockClass); //[cite: 1]
-
-                                                                    // Some reflectively-instantiated block classes (e.g. ChestLoadingExample, which
-                                                                    // extends vanilla ChestBlock) need to know, from inside their own
-                                                                    // Properties-only constructor, which BlockEntityType this exact block is about
-                                                                    // to be paired with below - see PowerPackLoaderRegistrationContext for why this
-                                                                    // can't just be passed as a constructor argument.
-                                                                    ResourceLocation entityTypeId = targetEntityClass != null
-                                                                            ? ResourceLocation.fromNamespaceAndPath(Mod_ID, blockNameIdFormated)
-                                                                            : null;
-
-                                                                    DeferredBlock<Block> registeredBlock = BLOCKS.register(blockNameIdFormated, () -> { //[cite: 1]
-                                                                        PowerPackLoaderRegistrationContext.setCurrentEntityTypeId(entityTypeId);
-                                                                        try { //[cite: 1]
-                                                                            return targetBlockClass.getConstructor(BlockBehaviour.Properties.class) //[cite: 1]
-                                                                                    .newInstance(BlockBehaviour.Properties.of() //[cite: 1]
-                                                                                            .strength(2.0f, 3.0f) //[cite: 1]
-                                                                                            .lightLevel(state -> 0) //[cite: 1]
-                                                                                            .noOcclusion() //[cite: 1]
-                                                                                            .dynamicShape()); //[cite: 1]
-                                                                        } catch (Exception e) { //[cite: 1]
-                                                                            throw new RuntimeException("Failed to instantiate block class: " + blockClass, e); //[cite: 1]
-                                                                        } finally { //[cite: 1]
-                                                                            PowerPackLoaderRegistrationContext.clearCurrentEntityTypeId();
-                                                                        } //[cite: 1]
-                                                                    }); //[cite: 1]
-
-                                                                    DeferredItem<BlockItem> registeredItem = ITEMS.register(blockNameIdFormated, //[cite: 1]
-                                                                            () -> new BlockItem(registeredBlock.get(), new Item.Properties()) //[cite: 1]
-                                                                    ); //[cite: 1]
-
-                                                                    // 3. Evaluate mapping: register BlockEntityType if an entity was mapped
-                                                                    if (targetEntityClass != null) {
-                                                                        REGISTERED_ENTITY_CLASSES.put(entityTypeId, targetEntityClass);
-                                                                        // Self-referencing box: the factory below needs to hand the entity class ITS
-                                                                        // OWN about-to-be-registered BlockEntityType (not some other/vanilla one), but
-                                                                        // that type doesn't exist yet while we're still building the Supplier that
-                                                                        // creates it. Safe because DeferredRegister only invokes this outer supplier
-                                                                        // later (at RegisterEvent time), by which point selfTypeHolder[0] below has
-                                                                        // already been assigned.
-                                                                        @SuppressWarnings({"unchecked", "rawtypes"})
-                                                                        DeferredHolder<BlockEntityType<?>, BlockEntityType<?>>[] selfTypeHolder = new DeferredHolder[1];
-                                                                        selfTypeHolder[0] = BLOCK_ENTITIES.register(blockNameIdFormated, () ->
-                                                                                BlockEntityType.Builder.of((BlockPos pos, BlockState state) ->
-                                                                                        instantiateBlockEntity(targetEntityClass, selfTypeHolder[0].get(), pos, state),
-                                                                                        registeredBlock.get()).build(null)
-                                                                        );
-                                                                        PowerNeoPackLoader.LOGGER.info("Dynamically registered functional block, item, AND entity from pack: {} (id: {})", displayName, blockNameIdFormated);
-                                                                    } else {
-                                                                        // Fallback to normal logging without entity registration[cite: 1]
-                                                                        PowerNeoPackLoader.LOGGER.info("Dynamically registered functional block & item from pack: {} (id: {})", displayName, blockNameIdFormated); //[cite: 1]
-                                                                    }
-
-                                                                    loader.registerPackItem(packId, registeredItem); //[cite: 1]
-
-                                                                } else {
-                                                                    PowerNeoPackLoader.LOGGER.error("Unknown or invalid block class in JSON: " + blockClass); //[cite: 1]
-                                                                }
-
-                                                            } else {
-                                                                PowerNeoPackLoader.LOGGER.warn("Skipping block file (missing 'class' field): " + blockFile.getFileName()); //[cite: 1]
-                                                            }
-                                                        } catch (Exception ex) { //[cite: 1]
-                                                            PowerNeoPackLoader.LOGGER.error("Failed to parse block file: " + blockFile.getFileName(), ex); //[cite: 1]
-                                                        }
-
-                                                    }); //[cite: 1]
-                                        } catch (Exception e) { //[cite: 1]
-                                            PowerNeoPackLoader.LOGGER.error("Failed to read blocks folder: " + blocksFolder, e); //[cite: 1]
+                                                    .filter(Files::isRegularFile)
+                                                    .filter(path -> path.toString().endsWith(".json"))
+                                                    .forEach(blockFile -> registerBlockFile(
+                                                            loader, classPicker, entityPicker, itemPicker, Mod_ID,
+                                                            BLOCKS, ITEMS, BLOCK_ENTITIES, packFolder, packId, blockFile));
+                                        } catch (Exception e) {
+                                            PowerNeoPackLoader.LOGGER.error("Failed to read blocks folder: " + blocksFolder, e);
                                         }
 
                                     } else {
-                                        PowerNeoPackLoader.LOGGER.warn("No valid blocks folder found at: " + blocksFolder); //[cite: 1]
+                                        PowerNeoPackLoader.LOGGER.warn("No valid blocks folder found at: " + blocksFolder);
                                     }
 
                                 } else {
-                                    PowerNeoPackLoader.LOGGER.warn("Skipping folder: " + packFolder.getFileName() + " (functional.meta.json is missing the 'id' field)"); //[cite: 1]
+                                    PowerNeoPackLoader.LOGGER.warn("Skipping folder: " + packFolder.getFileName()
+                                            + " (" + loader.getMetaFile() + " is missing the 'id' field)");
                                 }
 
-                            } catch (Exception e) { //[cite: 1]
-                                PowerNeoPackLoader.LOGGER.error("Failed to parse functional.meta.json in folder: " + packFolder.getFileName(), e); //[cite: 1]
+                            } catch (Exception e) {
+                                PowerNeoPackLoader.LOGGER.error("Failed to parse " + loader.getMetaFile()
+                                        + " in folder: " + packFolder.getFileName(), e);
                             }
 
                         } else {
-                            PowerNeoPackLoader.LOGGER.warn("Skipping folder (no functional.meta.json found): " + packFolder.getFileName()); //[cite: 1]
+                            PowerNeoPackLoader.LOGGER.warn("Skipping folder (no " + loader.getMetaFile() + " found): "
+                                    + packFolder.getFileName());
                         }
-                    }); //[cite: 1]
-        } catch (Exception e) { //[cite: 1]
-            PowerNeoPackLoader.LOGGER.error("Error scanning for functional blocks to register", e); //[cite: 1]
+                    });
+        } catch (Exception e) {
+            PowerNeoPackLoader.LOGGER.error("Error scanning for functional blocks to register", e);
         }
 
-        BLOCKS.register(modBus); //[cite: 1]
-        ITEMS.register(modBus); //[cite: 1]
-
-        // 4. Register all captured Block Entity Types to the Mod Event Bus
+        BLOCKS.register(modBus);
+        ITEMS.register(modBus);
         BLOCK_ENTITIES.register(modBus);
+    }
+
+    /**
+     * One block json -> one registered block + item (+ block entity type when mapped).
+     * <p>
+     * Split out of the folder walk above so the per-block work reads as a flat sequence rather than
+     * six levels of nesting inside three try-with-resources blocks. Anything that goes wrong is
+     * logged and skips this one block - a single malformed json in a player-editable pack folder
+     * must never take the game down with it.
+     */
+    private static void registerBlockFile(PowerPackLoaderPacksLoader loader, ClassPicker classPicker,
+                                          EntityPicker entityPicker, ItemPicker itemPicker, String Mod_ID,
+                                          DeferredRegister.Blocks BLOCKS, DeferredRegister.Items ITEMS,
+                                          DeferredRegister<BlockEntityType<?>> BLOCK_ENTITIES,
+                                          Path packFolder, String packId, Path blockFile) {
+        try (BufferedReader blockReader = Files.newBufferedReader(blockFile)) {
+            JsonObject blockJson = JsonParser.parseReader(blockReader).getAsJsonObject();
+
+            if (!blockJson.has("class")) {
+                PowerNeoPackLoader.LOGGER.warn("Skipping block file (missing 'class' field): " + blockFile.getFileName());
+                return;
+            }
+
+            String fileName = blockFile.getFileName().toString();
+            String blockId = fileName.substring(0, fileName.length() - ".json".length());
+            String displayName = blockJson.has("name") ? blockJson.get("name").getAsString() : blockId;
+            String blockNameIdFormated = packId + "_" + blockId;
+            String blockClass = blockJson.get("class").getAsString();
+            boolean isGeckoLib = blockJson.has("geckolib") && blockJson.get("geckolib").getAsBoolean();
+
+            Class<?> actualBlockClass = classPicker.getClassById(blockClass);
+
+            if (actualBlockClass == null || !Block.class.isAssignableFrom(actualBlockClass)) {
+                PowerNeoPackLoader.LOGGER.error(
+                        "Unknown or invalid block class '{}' in {} - is the class annotated with @PackBlock, "
+                                + "and does it belong to mod '{}'?", blockClass, blockFile.getFileName(), Mod_ID);
+                return;
+            }
+
+            @SuppressWarnings("unchecked")
+            Class<? extends Block> targetBlockClass = (Class<? extends Block>) actualBlockClass;
+
+            Class<?> targetEntityClass = entityPicker.getEnityByBlockClass(targetBlockClass);
+
+            // Same idea, for the item half: a block class with no entry here just gets a
+            // plain BlockItem below, same as always. See ItemPicker's class doc.
+            Class<?> targetItemClass = itemPicker.getItemByBlockClass(targetBlockClass);
+            // GeckoLibCompat.LOADED short-circuits BEFORE GeoItem.class ever gets
+            // evaluated/resolved - required so this line can't throw NoClassDefFoundError when
+            // GeckoLib isn't installed.
+            boolean isGeckoLibItem = GeckoLibCompat.LOADED && targetItemClass != null
+                    && GeoItem.class.isAssignableFrom(targetItemClass);
+
+            PowerPackLoaderModelGenerator.generate(loader, Mod_ID, packFolder, packId, blockId,
+                    blockNameIdFormated, targetBlockClass, isGeckoLib, isGeckoLibItem);
+
+            // Blocks with a mapped entity get their own dedicated BlockEntityType, whose id the
+            // block itself may need at construction time (a block extending a vanilla class that
+            // demands one). It can't be passed as a constructor argument - the type doesn't exist
+            // yet - so it travels inside the context instead; see PackBlockContext.
+            ResourceLocation entityTypeId = targetEntityClass != null
+                    ? ResourceLocation.fromNamespaceAndPath(Mod_ID, blockNameIdFormated)
+                    : null;
+
+            PackBlockContext context = new PackBlockContext(Mod_ID, packId, blockId, blockNameIdFormated,
+                    entityTypeId, blockJson, packFolder);
+
+            DeferredBlock<Block> registeredBlock = BLOCKS.register(blockNameIdFormated,
+                    () -> instantiateBlock(targetBlockClass, PackBlockProperties.build(blockJson, blockId), context));
+
+            DeferredItem<BlockItem> registeredItem = ITEMS.register(blockNameIdFormated,
+                    () -> instantiateItem(targetItemClass, registeredBlock.get(), context));
+
+            DeferredHolder<BlockEntityType<?>, BlockEntityType<?>> registeredEntityType = null;
+            if (targetEntityClass != null) {
+                REGISTERED_ENTITY_CLASSES.put(entityTypeId, targetEntityClass);
+                // Self-referencing box: the factory below needs to hand the entity class ITS OWN
+                // about-to-be-registered BlockEntityType (not some other/vanilla one), but that type
+                // doesn't exist yet while we're still building the Supplier that creates it. Safe
+                // because DeferredRegister only invokes this outer supplier later (at RegisterEvent
+                // time), by which point selfTypeHolder[0] below has already been assigned.
+                @SuppressWarnings({"unchecked", "rawtypes"})
+                DeferredHolder<BlockEntityType<?>, BlockEntityType<?>>[] selfTypeHolder = new DeferredHolder[1];
+                selfTypeHolder[0] = BLOCK_ENTITIES.register(blockNameIdFormated, () ->
+                        BlockEntityType.Builder.of((BlockPos pos, BlockState state) ->
+                                        instantiateBlockEntity(targetEntityClass, selfTypeHolder[0].get(), pos, state),
+                                registeredBlock.get()).build(null)
+                );
+                registeredEntityType = selfTypeHolder[0];
+                PowerNeoPackLoader.LOGGER.info("Dynamically registered block, item AND entity from pack: {} (id: {})",
+                        displayName, blockNameIdFormated);
+            } else {
+                PowerNeoPackLoader.LOGGER.info("Dynamically registered block & item from pack: {} (id: {})",
+                        displayName, blockNameIdFormated);
+            }
+
+            loader.registerPackItem(packId, registeredItem);
+            PowerPackLoaderRegistry.record(new PowerPackLoaderRegistry.PackBlockEntry(
+                    context, registeredBlock, registeredItem, registeredEntityType));
+
+        } catch (Exception ex) {
+            PowerNeoPackLoader.LOGGER.error("Failed to parse block file: " + blockFile.getFileName(), ex);
+        }
     }
 }

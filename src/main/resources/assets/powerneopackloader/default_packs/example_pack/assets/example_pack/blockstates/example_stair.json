@@ -1,0 +1,8 @@
+{
+  "variants": {
+    "facing=north": { "model": "example_pack:block/example_stair", "y": 180},
+    "facing=east":  { "model": "example_pack:block/example_stair", "y": 270 },
+    "facing=south": { "model": "example_pack:block/example_stair"},
+    "facing=west":  { "model": "example_pack:block/example_stair", "y": 90 }
+  }
+}

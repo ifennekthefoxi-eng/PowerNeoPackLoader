@@ -34,6 +34,7 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
@@ -44,8 +45,17 @@ public class PowerPackLoaderPacksLoader implements RepositorySource {
     private static final Marker MARKER = MarkerManager.getMarker("CACWEnginePackFinder");
     private static final Gson GSON = new GsonBuilder().create();
 
-    // Central registry for auto-event discovery
-    public static final List<PowerPackLoaderPacksLoader> ALL_LOADERS = new ArrayList<>();
+    /**
+     * Every loader any mod has created, so {@code PowerPackLoaderModBusEvents} can add them all to
+     * the game's pack repositories and {@code PowerPackLoaderCommand} can list them, without either
+     * needing to know which mods exist.
+     * <p>
+     * Copy-on-write because FML constructs mods in PARALLEL: several mods' constructors add to this
+     * list at the same time, while the pack-finder event iterates it. A plain ArrayList would both
+     * risk losing an entry and throw ConcurrentModificationException mid-iteration. Writes happen
+     * once per loader at startup and reads are frequent, which is exactly this list's trade-off.
+     */
+    public static final List<PowerPackLoaderPacksLoader> ALL_LOADERS = new CopyOnWriteArrayList<>();
 
     // Instance-bound record for folder-based default packs
     public record DefaultResourceEntry(Class<?> modClass, String srcPath, String extraDirName) {}

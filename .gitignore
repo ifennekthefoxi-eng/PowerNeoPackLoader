@@ -38,3 +38,6 @@ run/
 **/src/generated/**/.cache/
 repo/
 !**/src/**/repo/
+
+### Project snapshot archive (build artifact, not source)
+/PowerNeoPackLoader.zip

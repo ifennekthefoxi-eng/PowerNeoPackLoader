@@ -6,6 +6,7 @@ import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.suggestion.Suggestions;
 import com.mojang.brigadier.suggestion.SuggestionsBuilder;
 import com.fennek.powerneopackloader.PowerNeoPackLoader;
+import com.fennek.powerneopackloader.Registration.PowerPackLoaderRegistry;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.SharedSuggestionProvider;
@@ -38,6 +39,18 @@ public class PowerPackLoaderCommand {
         dispatcher.register(
                 Commands.literal("pnpl")
                         .requires(source -> source.hasPermission(2))
+
+                        // /pnpl blocks [mod_id] - what actually got registered. The first thing to
+                        // check when a pack block doesn't show up in game: it separates "the pack
+                        // was never read" from "the block json was rejected" from "it registered
+                        // fine and the problem is its model or renderer".
+                        .then(Commands.literal("blocks")
+                                .executes(context -> listBlocks(context, null))
+                                .then(Commands.argument("mod_id", StringArgumentType.string())
+                                        .suggests(PowerPackLoaderCommand::suggestModIds)
+                                        .executes(context -> listBlocks(context, StringArgumentType.getString(context, "mod_id")))
+                                )
+                        )
 
                         // /pnpl <loader_name>
                         .then(Commands.argument("loader", StringArgumentType.string())
@@ -165,7 +178,58 @@ public class PowerPackLoaderCommand {
         return SharedSuggestionProvider.suggest(folderPaths, builder);
     }
 
+    private static CompletableFuture<Suggestions> suggestModIds(CommandContext<CommandSourceStack> context, SuggestionsBuilder builder) {
+        Set<String> modIds = new TreeSet<>();
+        for (PowerPackLoaderPacksLoader loader : PowerPackLoaderPacksLoader.ALL_LOADERS) {
+            modIds.add(loader.getModId());
+        }
+        return SharedSuggestionProvider.suggest(modIds, builder);
+    }
+
     // --- COMMAND EXECUTION LOGIC ---
+
+    /**
+     * Lists every block this library registered from a pack, grouped by pack, with its real
+     * registry id and whether it got a block entity - i.e. exactly the facts needed to tell which
+     * stage of the pipeline a missing block fell out of.
+     *
+     * @param modId the mod to list, or null for every mod using the library.
+     */
+    private static int listBlocks(CommandContext<CommandSourceStack> context, String modId) {
+        CommandSourceStack source = context.getSource();
+
+        Set<String> modIds = new TreeSet<>();
+        if (modId != null) {
+            modIds.add(modId);
+        } else {
+            for (PowerPackLoaderPacksLoader loader : PowerPackLoaderPacksLoader.ALL_LOADERS) {
+                modIds.add(loader.getModId());
+            }
+        }
+
+        int total = 0;
+        for (String id : modIds) {
+            List<String> packIds = PowerPackLoaderRegistry.packIds(id);
+            if (packIds.isEmpty()) {
+                source.sendSuccess(() -> Component.literal("§7No pack blocks registered for §e" + id), false);
+                continue;
+            }
+            source.sendSuccess(() -> Component.literal("§a--- Pack blocks for [" + id + "] ---"), false);
+            for (String packId : packIds) {
+                var entries = PowerPackLoaderRegistry.byPack(id, packId);
+                source.sendSuccess(() -> Component.literal("§6" + packId + " §7(" + entries.size() + ")"), false);
+                for (var entry : entries) {
+                    String suffix = entry.entityType() != null ? " §8[block entity]" : "";
+                    source.sendSuccess(() -> Component.literal("§7  - §f" + entry.id() + suffix), false);
+                }
+                total += entries.size();
+            }
+        }
+
+        int shown = total;
+        source.sendSuccess(() -> Component.literal("§a" + shown + " pack block(s) registered."), false);
+        return 1;
+    }
 
     private static int listPacks(CommandContext<CommandSourceStack> context, String loaderName) {
         CommandSourceStack source = context.getSource();

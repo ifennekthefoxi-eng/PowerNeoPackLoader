@@ -1,70 +1,67 @@
 package com.fennek.powerneopackloader.CoreComponentes;
 
-import net.minecraft.core.registries.BuiltInRegistries;
+import com.fennek.powerneopackloader.APIBridge.PackBlockContext;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.BlockEntityType;
+import org.jetbrains.annotations.Nullable;
 
 import java.util.function.Supplier;
 
 /**
- * Bridges {@code PowerNeoPackLoaderRegister}'s reflective block construction
- * ({@code targetBlockClass.getConstructor(Properties.class).newInstance(...)}) with block classes
- * that need to know, at construction time, which {@link BlockEntityType} PowerNeoPackLoaderRegister
- * is about to register alongside them (e.g. {@code ChestLoadingExample}, which must hand its own
- * dynamically-registered type - not vanilla's shared {@code BlockEntityType.CHEST} - to
- * {@code ChestBlock}'s constructor).
+ * The original, entity-type-only view of what is now {@link PackBlockContext}.
  * <p>
- * A block subclass can't just capture {@code this} in a lambda passed up to {@code super(...)} -
- * the object doesn't exist yet at that point, and the compiler rejects it. This sidesteps that by
- * having {@code PowerNeoPackLoaderRegister} stash the target registry name in a {@link ThreadLocal}
- * immediately before it reflectively constructs the block, so the block's constructor can read
- * "what id am I being registered as" without ever needing a reference to itself.
- * <p>
- * Block registration in this loader runs single-threaded and each block's constructor call
- * completes fully before the next one starts, so a plain {@link ThreadLocal} (cleared in a
- * {@code finally} block by the caller) is enough - no risk of one pack block reading another's id.
+ * Kept so block classes written against it keep compiling and behaving identically; everything it
+ * offers is a strict subset of {@link PackBlockContext}, which also carries the block's own pack
+ * json, its pack and block ids, and its pack folder. New code should use that directly:
+ * <pre>{@code
+ * // then
+ * super(PowerPackLoaderRegistrationContext.resolveEntityTypeSupplier(() -> BlockEntityType.CHEST));
+ * // now
+ * super(PackBlockContext.current()
+ *         .map(c -> c.<ChestBlockEntity>blockEntityTypeSupplier(() -> BlockEntityType.CHEST))
+ *         .orElse(() -> BlockEntityType.CHEST));
+ * }</pre>
+ *
+ * @deprecated use {@link PackBlockContext} instead.
  */
+@Deprecated
 public final class PowerPackLoaderRegistrationContext {
-
-    private static final ThreadLocal<ResourceLocation> CURRENT_ENTITY_TYPE_ID = new ThreadLocal<>();
 
     private PowerPackLoaderRegistrationContext() {}
 
-    /** Called by PowerNeoPackLoaderRegister right before it reflectively constructs a block. */
-    public static void setCurrentEntityTypeId(ResourceLocation id) {
-        CURRENT_ENTITY_TYPE_ID.set(id);
-    }
-
-    /** Called by PowerNeoPackLoaderRegister right after, in a finally block, regardless of outcome. */
-    public static void clearCurrentEntityTypeId() {
-        CURRENT_ENTITY_TYPE_ID.remove();
+    /**
+     * No longer does anything: the loader now publishes a whole {@link PackBlockContext} (which
+     * includes the entity type id) around block construction, so there is no separate id to set.
+     *
+     * @deprecated the loader manages the context itself; calling this has no effect.
+     */
+    @Deprecated
+    public static void setCurrentEntityTypeId(@Nullable ResourceLocation id) {
     }
 
     /**
-     * For use inside a block constructor's {@code super(...)} call. Captures whichever id was set
-     * by PowerNeoPackLoaderRegister for THIS construction (reading the ThreadLocal now, before
-     * returning), then returns a supplier that lazily resolves that id against the block entity
-     * type registry each time it's asked - by which point PowerNeoPackLoaderRegister will have
-     * finished registering it.
-     * <p>
-     * Falls back to {@code fallback} if no id was set (e.g. someone constructs this block class
-     * directly rather than through the pack loader) or if nothing is registered under that id yet
-     * when resolved.
+     * No longer does anything - see {@link #setCurrentEntityTypeId}.
+     *
+     * @deprecated the loader manages the context itself; calling this has no effect.
      */
-    @SuppressWarnings("unchecked")
+    @Deprecated
+    public static void clearCurrentEntityTypeId() {
+    }
+
+    /**
+     * For use inside a block constructor's {@code super(...)} call: a supplier that lazily resolves
+     * the {@link BlockEntityType} being registered for the block currently under construction,
+     * falling back to {@code fallback} when there is none (or when this class is constructed
+     * outside the loader entirely).
+     *
+     * @deprecated use {@link PackBlockContext#blockEntityTypeSupplier(Supplier)}.
+     */
+    @Deprecated
     public static <T extends BlockEntity> Supplier<BlockEntityType<? extends T>> resolveEntityTypeSupplier(
             Supplier<BlockEntityType<? extends T>> fallback) {
-        ResourceLocation id = CURRENT_ENTITY_TYPE_ID.get();
-        if (id == null) {
-            return fallback;
-        }
-        return () -> {
-            BlockEntityType<?> type = BuiltInRegistries.BLOCK_ENTITY_TYPE.get(id);
-            if (type == null) {
-                return fallback.get();
-            }
-            return (BlockEntityType<? extends T>) type;
-        };
+        return PackBlockContext.current()
+                .map(context -> context.<T>blockEntityTypeSupplier(fallback))
+                .orElse(fallback);
     }
 }

@@ -5,16 +5,19 @@ import net.minecraft.server.packs.PackType;
 import net.minecraft.server.packs.repository.Pack;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
-import net.neoforged.neoforge.capabilities.RegisterCapabilitiesEvent;
 import net.neoforged.neoforge.event.AddPackFindersEvent;
 
+/**
+ * Adds every registered loader's packs to the game's pack repositories, for both sides. Subscribed
+ * once under this library's own mod id - a consuming mod's packs are picked up here too, because
+ * {@link PowerPackLoaderPacksLoader#ALL_LOADERS} holds every loader from every mod.
+ * <p>
+ * Capabilities a pack block entity needs are that mod's own business and belong on that mod's bus,
+ * so there is deliberately no capability hook here. (An empty one used to sit in this class,
+ * carried over from the mod this library was extracted from.)
+ */
 @EventBusSubscriber(modid = PowerNeoPackLoader.MOD_ID, bus = EventBusSubscriber.Bus.MOD)
 public class PowerPackLoaderModBusEvents {
-
-    @SubscribeEvent
-    public static void registerCapabilities(RegisterCapabilitiesEvent event) {
-        // FourLineEngineBlockEntity.registerCapabilities(event);
-    }
 
     @SubscribeEvent
     public static void onAddPackFinders(AddPackFindersEvent event) {
