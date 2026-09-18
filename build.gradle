@@ -34,14 +34,21 @@ repositories {
     }
 }
 
-dependencies {
-    // GeckoLib Implementation
-    implementation "software.bernie.geckolib:geckolib-neoforge-${project.minecraft_version}:${project.geckolib_version}"
-}
-
 configurations {
     localRuntime
     runtimeClasspath.extendsFrom localRuntime
+}
+
+dependencies {
+    // GeckoLib is OPTIONAL - every reference to it is gated behind GeckoLibCompat.LOADED, and
+    // neoforge.mods.toml declares it optional too. compileOnly (not implementation) so it stays
+    // out of the published POM: an `implementation` dep is exported to consumers, which forced
+    // every mod using this library to resolve GeckoLib from a repository it has no reason to
+    // have configured, turning an optional dependency into a hard build failure.
+    // localRuntime keeps it available for THIS project's own dev runs, where the example
+    // GeckoLib block needs it.
+    compileOnly "software.bernie.geckolib:geckolib-neoforge-${project.minecraft_version}:${project.geckolib_version}"
+    localRuntime "software.bernie.geckolib:geckolib-neoforge-${project.minecraft_version}:${project.geckolib_version}"
 }
 
 def generateModMetadata = tasks.register("generateModMetadata", ProcessResources) {

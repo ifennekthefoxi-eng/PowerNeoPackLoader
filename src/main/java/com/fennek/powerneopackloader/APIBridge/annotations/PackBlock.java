@@ -87,4 +87,27 @@ public @interface PackBlock {
      * on the client, so a dedicated server never loads the renderer class.
      */
     Class<?> renderer() default void.class;
+
+    /**
+     * Mod ids this block class needs in order to work. It is skipped entirely - not registered,
+     * and unknown to any pack json naming it - unless every one of them is loaded.
+     * <p>
+     * <b>Declare this whenever the class touches an optional dependency anywhere</b>, including in
+     * a method body, and not only in its own {@code extends}/{@code implements} clause. Skipping
+     * the class is the only safe answer, because the failure otherwise arrives far too late to
+     * handle: the loader can resolve the class fine (resolution doesn't run method bodies), but the
+     * JVM verifies a class the first time it is instantiated, and verification resolves the types
+     * its methods mention in order to type-check them. So a block that merely RETURNS a
+     * {@code new MyGeckoLibBlockEntity(...)} from {@code newBlockEntity} throws
+     * {@link NoClassDefFoundError} from inside the registry event on an install without GeckoLib -
+     * which FML reports as a fatal mod-loading error, taking the whole game down rather than that
+     * one block.
+     * <pre>{@code
+     * @PackBlock(requiredMods = "geckolib", entity = MyGeoBlockEntity.class)
+     * public class MyGeoBlock extends Block implements EntityBlock { ... }
+     * }</pre>
+     * A pack json naming a skipped class logs the usual "unknown block class" error, so a pack
+     * built around an optional dependency degrades to its other blocks instead of failing.
+     */
+    String[] requiredMods() default {};
 }

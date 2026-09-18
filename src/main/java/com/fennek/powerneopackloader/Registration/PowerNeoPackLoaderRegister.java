@@ -7,7 +7,9 @@ import com.fennek.powerneopackloader.CoreComponentes.ClassPicker;
 import com.fennek.powerneopackloader.CoreComponentes.EntityPicker;
 import com.fennek.powerneopackloader.CoreComponentes.GeckoLibCompat;
 import com.fennek.powerneopackloader.CoreComponentes.ItemPicker;
+import com.fennek.powerneopackloader.CoreComponentes.PackAnnotationScanner;
 import com.fennek.powerneopackloader.CoreComponentes.PackBlockProperties;
+import com.fennek.powerneopackloader.CoreComponentes.PackRegistryNames;
 import com.fennek.powerneopackloader.PowerNeoPackLoader;
 import com.fennek.powerneopackloader.loadingPacks.PowerPackLoaderPacksLoader;
 import net.minecraft.core.BlockPos;
@@ -31,6 +33,7 @@ import java.io.BufferedReader;
 import java.lang.reflect.Constructor;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
@@ -214,6 +217,11 @@ public class PowerNeoPackLoaderRegister {
 
                                 if (metaJson.has("id")) {
                                     String packId = metaJson.get("id").getAsString();
+                                    // A pack declaring itself part of the mod's own content rather
+                                    // than an addition beside it - its blocks drop the pack prefix.
+                                    // See PackRegistryNames.
+                                    boolean extendOriginal = metaJson.has("extend_original")
+                                            && metaJson.get("extend_original").getAsBoolean();
 
                                     PowerPackLoaderLangGenerator.generate(loader, packFolder, packId);
                                     PowerPackLoaderRegistry.clearPack(Mod_ID, packId);
@@ -228,7 +236,8 @@ public class PowerNeoPackLoaderRegister {
                                                     .filter(path -> path.toString().endsWith(".json"))
                                                     .forEach(blockFile -> registerBlockFile(
                                                             loader, classPicker, entityPicker, itemPicker, Mod_ID,
-                                                            BLOCKS, ITEMS, BLOCK_ENTITIES, packFolder, packId, blockFile));
+                                                            BLOCKS, ITEMS, BLOCK_ENTITIES, packFolder, packId,
+                                                            extendOriginal, blockFile));
                                         } catch (Exception e) {
                                             PowerNeoPackLoader.LOGGER.error("Failed to read blocks folder: " + blocksFolder, e);
                                         }
@@ -273,7 +282,7 @@ public class PowerNeoPackLoaderRegister {
                                           EntityPicker entityPicker, ItemPicker itemPicker, String Mod_ID,
                                           DeferredRegister.Blocks BLOCKS, DeferredRegister.Items ITEMS,
                                           DeferredRegister<BlockEntityType<?>> BLOCK_ENTITIES,
-                                          Path packFolder, String packId, Path blockFile) {
+                                          Path packFolder, String packId, boolean extendOriginal, Path blockFile) {
         try (BufferedReader blockReader = Files.newBufferedReader(blockFile)) {
             JsonObject blockJson = JsonParser.parseReader(blockReader).getAsJsonObject();
 
@@ -285,16 +294,30 @@ public class PowerNeoPackLoaderRegister {
             String fileName = blockFile.getFileName().toString();
             String blockId = fileName.substring(0, fileName.length() - ".json".length());
             String displayName = blockJson.has("name") ? blockJson.get("name").getAsString() : blockId;
-            String blockNameIdFormated = packId + "_" + blockId;
+            // Not simply packId + "_" + blockId any more: an extend_original pack registers under
+            // the bare block id, and either form falls through to a counted name rather than
+            // overwriting an existing one. See PackRegistryNames.
+            String blockNameIdFormated = PackRegistryNames.allocate(Mod_ID, packId, blockId, extendOriginal);
             String blockClass = blockJson.get("class").getAsString();
             boolean isGeckoLib = blockJson.has("geckolib") && blockJson.get("geckolib").getAsBoolean();
 
             Class<?> actualBlockClass = classPicker.getClassById(blockClass);
 
             if (actualBlockClass == null || !Block.class.isAssignableFrom(actualBlockClass)) {
-                PowerNeoPackLoader.LOGGER.error(
-                        "Unknown or invalid block class '{}' in {} - is the class annotated with @PackBlock, "
-                                + "and does it belong to mod '{}'?", blockClass, blockFile.getFileName(), Mod_ID);
+                // Distinguish "this block needs a mod you don't have" from "that class name is
+                // wrong". The first is normal, expected degradation for a pack built around an
+                // optional dependency; logging it at ERROR alongside real mistakes teaches people
+                // to ignore the log.
+                List<String> missingMods = PackAnnotationScanner.missingModsFor(Mod_ID, blockClass);
+                if (!missingMods.isEmpty()) {
+                    PowerNeoPackLoader.LOGGER.info(
+                            "Skipping '{}' from pack '{}': its class '{}' requires missing mod(s) {}.",
+                            blockId, packId, blockClass, missingMods);
+                } else {
+                    PowerNeoPackLoader.LOGGER.error(
+                            "Unknown or invalid block class '{}' in {} - is the class annotated with @PackBlock, "
+                                    + "and does it belong to mod '{}'?", blockClass, blockFile.getFileName(), Mod_ID);
+                }
                 return;
             }
 
@@ -313,7 +336,7 @@ public class PowerNeoPackLoaderRegister {
                     && GeoItem.class.isAssignableFrom(targetItemClass);
 
             PowerPackLoaderModelGenerator.generate(loader, Mod_ID, packFolder, packId, blockId,
-                    blockNameIdFormated, targetBlockClass, isGeckoLib, isGeckoLibItem);
+                    blockNameIdFormated, targetBlockClass, isGeckoLib, isGeckoLibItem, blockJson);
 
             // Blocks with a mapped entity get their own dedicated BlockEntityType, whose id the
             // block itself may need at construction time (a block extending a vanilla class that

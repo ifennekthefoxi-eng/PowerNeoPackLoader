@@ -94,6 +94,49 @@ public final class GetJarResources {
     }
 
     /**
+     * Copies a directory that has already been resolved to a {@link Path} - the form NeoForge's
+     * own {@code IModFile#findResource} hands back, which works uniformly whether the mod is a jar
+     * (a zip filesystem path) or an exploded directory (a dev workspace).
+     * <p>
+     * This exists because {@code Class#getResource} does NOT: for a mod loaded from directories, it
+     * returns null for a DIRECTORY resource, so a mod's default packs were silently never found in
+     * a dev workspace while working perfectly from a built jar. Resolving through the mod file
+     * instead removes the difference entirely.
+     */
+    public static void copyModDirectory(Path source, Path root, String path) {
+        Path target = root.resolve(path);
+        try {
+            if (!Files.isDirectory(source, new LinkOption[0])) {
+                return;
+            }
+            PowerNeoPackLoader.LOGGER.info("Exporting resource pack {} to {}", source, target);
+            if (Files.isDirectory(target, new LinkOption[0])) {
+                backupFiles(target);
+                deleteFiles(target);
+            }
+            copyPathBackedFolder(source, target);
+        } catch (IOException e) {
+            PowerNeoPackLoader.LOGGER.error("Failed to export default pack {} to {}: {}", source, target, e.getMessage());
+        }
+    }
+
+    /** The immediate subdirectory names of an already-resolved directory - the {@link Path}
+     *  counterpart of {@link #listChildDirectories(Class, String)}, for the same reason. */
+    public static List<String> listChildDirectories(Path root) {
+        if (root == null || !Files.isDirectory(root, new LinkOption[0])) {
+            return List.of();
+        }
+        List<String> names = new ArrayList<>();
+        try (Stream<Path> children = Files.list(root)) {
+            children.filter(path -> Files.isDirectory(path, new LinkOption[0]))
+                    .forEach(path -> names.add(path.getFileName().toString().replace("/", "")));
+        } catch (Exception e) {
+            PowerNeoPackLoader.LOGGER.warn("Failed to list default packs in {}: {}", root, e.getMessage());
+        }
+        return names;
+    }
+
+    /**
      * The names of the immediate subdirectories of a directory inside {@code resourceClass}'s own
      * jar - used to discover every default pack a mod ships under
      * {@code assets/<modId>/default_packs/} without the mod having to name them one by one.

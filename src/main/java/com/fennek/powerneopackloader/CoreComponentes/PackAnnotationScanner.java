@@ -14,6 +14,8 @@ import org.jetbrains.annotations.Nullable;
 import org.objectweb.asm.Type;
 
 import java.lang.annotation.ElementType;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -98,9 +100,21 @@ public final class PackAnnotationScanner {
             }
 
             Map<String, Object> members = data.annotationData();
+
             String id = stringMember(members, "id");
             if (id == null || id.isBlank()) {
                 id = blockClass.getSimpleName();
+            }
+
+            List<String> missing = missingMods(members);
+            if (!missing.isEmpty()) {
+                // Skipped, not failed: see @PackBlock#requiredMods for why registering it anyway
+                // is fatal rather than merely broken. Remembered under the id packs refer to it by,
+                // so a pack naming it gets told WHY it's unavailable instead of "unknown class".
+                recordSkipped(modId, id, missing);
+                PowerNeoPackLoader.LOGGER.info("Skipping @PackBlock '{}' ({}) - requires missing mod(s) {}.",
+                        id, blockClass.getSimpleName(), missing);
+                continue;
             }
 
             classPicker.AddClass(id, blockClass);
@@ -189,6 +203,49 @@ public final class PackAnnotationScanner {
             }
         }
         return null;
+    }
+
+    /**
+     * modId -> pack class id -> the mods it needed but didn't get.
+     * <p>
+     * Purely so the register step can tell a pack author "that block needs GeckoLib" instead of
+     * "unknown block class", which is the same message a typo produces and sends them looking in
+     * entirely the wrong place.
+     */
+    private static final Map<String, Map<String, List<String>>> SKIPPED = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static void recordSkipped(String modId, String classId, List<String> missingMods) {
+        SKIPPED.computeIfAbsent(modId, key -> new java.util.concurrent.ConcurrentHashMap<>())
+                .put(classId, List.copyOf(missingMods));
+    }
+
+    /**
+     * The mods that {@code classId} needed but didn't get, or empty if it wasn't skipped for that
+     * reason - i.e. the name is genuinely unknown.
+     */
+    public static List<String> missingModsFor(String modId, String classId) {
+        return SKIPPED.getOrDefault(modId, Map.of()).getOrDefault(classId, List.of());
+    }
+
+    /**
+     * The {@code requiredMods} entries that are not loaded. Empty when the block can register.
+     * <p>
+     * ASM reports an array-valued annotation member as a {@link List}, and omits it entirely when
+     * it was left at its default - so an absent member means "needs nothing", not "needs nothing
+     * known".
+     */
+    private static List<String> missingMods(Map<String, Object> members) {
+        if (!(members.get("requiredMods") instanceof List<?> required) || required.isEmpty()) {
+            return List.of();
+        }
+        List<String> missing = new ArrayList<>();
+        for (Object entry : required) {
+            String modId = String.valueOf(entry);
+            if (!ModList.get().isLoaded(modId)) {
+                missing.add(modId);
+            }
+        }
+        return missing;
     }
 
     /** A String-valued annotation member, or null when the modder left it at its default (ASM

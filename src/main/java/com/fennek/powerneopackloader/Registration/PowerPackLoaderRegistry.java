@@ -139,6 +139,27 @@ public final class PowerPackLoaderRegistry {
         }
     }
 
+    /**
+     * Finds a pack block by the ids a pack author writes, without needing to know which mod
+     * registered it.
+     * <p>
+     * For code that only ever sees pack-scoped ids - a resource id like {@code <packId>:<blockId>},
+     * say - and has to get back to the block's REAL registry name, which is not derivable by string
+     * concatenation: an {@code extend_original} pack drops the prefix, and a collision appends a
+     * counter. See {@link com.fennek.powerneopackloader.CoreComponentes.PackRegistryNames}.
+     */
+    public static Optional<PackBlockEntry> findByPackAndBlock(String packId, String blockId) {
+        synchronized (LOCK) {
+            for (Map<String, Map<String, PackBlockEntry>> byPack : ENTRIES.values()) {
+                Map<String, PackBlockEntry> blocks = byPack.get(packId);
+                if (blocks != null && blocks.containsKey(blockId)) {
+                    return Optional.of(blocks.get(blockId));
+                }
+            }
+            return Optional.empty();
+        }
+    }
+
     /** The pack ids {@code modId} has registered blocks for, in discovery order. */
     public static List<String> packIds(String modId) {
         synchronized (LOCK) {

@@ -61,6 +61,17 @@ public class PowerPackLoaderPacksLoader implements RepositorySource {
     public record DefaultResourceEntry(Class<?> modClass, String srcPath, String extraDirName) {}
     private final List<DefaultResourceEntry> defaultResources = new ArrayList<>();
 
+    /**
+     * Default packs whose source directory has already been resolved to a {@link Path}, via
+     * NeoForge's own mod-file resource lookup.
+     * <p>
+     * Preferred over {@link DefaultResourceEntry}'s {@code Class#getResource} route, which cannot
+     * see a DIRECTORY resource when a mod is loaded from exploded directories rather than a jar -
+     * i.e. in every dev workspace. See {@code PackLoaderBuilder}.
+     */
+    public record DefaultPathEntry(Path source, String extraDirName) {}
+    private final List<DefaultPathEntry> defaultPathResources = new ArrayList<>();
+
     public PackType packType;
     private final String directoryName;
     private final String modId;
@@ -97,6 +108,12 @@ public class PowerPackLoaderPacksLoader implements RepositorySource {
         this.defaultResources.add(new DefaultResourceEntry(modClass, srcPath, extraDirName));
     }
 
+    /** Registers a default pack whose source directory is already a {@link Path} - see
+     *  {@link DefaultPathEntry}. */
+    public void addDefaultResource(Path source, String extraDirName) {
+        this.defaultPathResources.add(new DefaultPathEntry(source, extraDirName));
+    }
+
     /**
      * Generates the root directory and copies default packs from the JAR early.
      * Called during mod initialization to ensure packs exist before the game scans.
@@ -110,6 +127,16 @@ public class PowerPackLoaderPacksLoader implements RepositorySource {
             } catch (Exception e) {
                 PowerNeoPackLoader.LOGGER.warn(MARKER, "Failed to init directory structure at {}", rootFolder, e);
                 return;
+            }
+        }
+
+        // Path-resolved default packs (the normal route - see DefaultPathEntry).
+        for (DefaultPathEntry entry : this.defaultPathResources) {
+            Path targetDir = rootFolder.resolve(entry.extraDirName());
+            if (!Files.isDirectory(targetDir)) {
+                PowerNeoPackLoader.LOGGER.info(MARKER, "Copying default pack folder '{}' into {}",
+                        entry.extraDirName(), targetDir);
+                GetJarResources.copyModDirectory(entry.source(), rootFolder, entry.extraDirName());
             }
         }
 
@@ -326,6 +353,9 @@ public class PowerPackLoaderPacksLoader implements RepositorySource {
     public static class PackMeta {
         public String name;
         public String id;
+        /** See PackRegistryNames - blocks of a pack with this set register without the pack
+         *  prefix, as part of the mod's own content. */
+        public boolean extend_original;
     }
 
     public List<EnginePack> getDiscoveredPacks() {

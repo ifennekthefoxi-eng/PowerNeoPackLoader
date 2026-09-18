@@ -3,6 +3,7 @@ package com.fennek.powerneopackloader.CoreComponentes;
 import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.fennek.powerneopackloader.PowerNeoPackLoader;
+import com.fennek.powerneopackloader.Registration.PowerPackLoaderRegistry;
 import net.minecraft.core.Direction;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.packs.resources.ResourceManager;
@@ -77,8 +78,22 @@ public class PowerPackLoaderCollisionLoader extends SimpleJsonResourceReloadList
                 List<AABB> southBoxes = toBoxes(model);
                 if (southBoxes.isEmpty()) return; // no usable elements - same as no file at all
 
-                ResourceLocation registryId = ResourceLocation.fromNamespaceAndPath(
-                        PowerNeoPackLoader.MOD_ID, packScopedId.getNamespace() + "_" + packScopedId.getPath());
+                // Ask the registry what this block was ACTUALLY registered as, rather than
+                // rebuilding the name. Two things made the old
+                // "<this library's mod id>:<packId>_<blockId>" guess wrong: it named THIS library
+                // instead of the mod that owns the block, so a consuming mod's collision shapes
+                // were filed under an id nothing would ever look up; and the prefixed form is only
+                // one of the names a block can end up with - an extend_original pack drops the
+                // prefix, a collision adds a counter. See PackRegistryNames.
+                ResourceLocation registryId = PowerPackLoaderRegistry
+                        .findByPackAndBlock(packScopedId.getNamespace(), packScopedId.getPath())
+                        .map(PowerPackLoaderRegistry.PackBlockEntry::id)
+                        .orElse(null);
+                if (registryId == null) {
+                    // A collisions json with no matching block - another mod's data, or a leftover
+                    // file for a block that was renamed or removed. Not an error.
+                    return;
+                }
 
                 EnumMap<Direction, VoxelShape> perFacing = new EnumMap<>(Direction.class);
                 for (Direction facing : Direction.Plane.HORIZONTAL) {
@@ -89,6 +104,19 @@ public class PowerPackLoaderCollisionLoader extends SimpleJsonResourceReloadList
                     perFacing.put(facing, shape);
                 }
                 SHAPES_BY_BLOCK.put(registryId, perFacing);
+
+                // Logged because "is my collisions json actually being read?" is otherwise
+                // unanswerable from outside the game: a file that never loads and a file that
+                // loads but produces an unexpected shape look identical when you stand in front
+                // of the block. These are the unrotated (south) bounds in block space, so they
+                // can be compared straight against the json's own from/to divided by 16.
+                VoxelShape southShape = perFacing.get(Direction.SOUTH);
+                PowerNeoPackLoader.LOGGER.info(
+                        "Loaded {} collision box(es) for {} - bounds x {}..{}, y {}..{}, z {}..{}",
+                        southBoxes.size(), registryId,
+                        southShape.min(Direction.Axis.X), southShape.max(Direction.Axis.X),
+                        southShape.min(Direction.Axis.Y), southShape.max(Direction.Axis.Y),
+                        southShape.min(Direction.Axis.Z), southShape.max(Direction.Axis.Z));
             } catch (Exception e) {
                 PowerNeoPackLoader.LOGGER.warn(
                         "Failed to parse collision model '{}', block will use the default collision box: {}",
@@ -112,9 +140,32 @@ public class PowerPackLoaderCollisionLoader extends SimpleJsonResourceReloadList
     }
 
     /**
-     * Reads a model's "elements" into plain 0..1-space AABBs (min/max normalized so a pack
-     * author swapping from/to on an axis can't produce an inverted box). These are always in
-     * the SOUTH reference orientation - {@link #rotateHorizontal} does the per-facing work.
+     * Reads a model's {@code "elements"} into 0..1-space AABBs, ONE BOX PER ELEMENT, exactly as
+     * the json writes it.
+     *
+     * <h2>The rule: 1:1 with the file</h2>
+     * Every element becomes the box its own {@code from}/{@code to} describe, divided by 16.
+     * Nothing is inferred, expanded, merged, approximated or corrected. If a collisions json and a
+     * model json are the same file, the collider is the model's boxes - so what you draw is what
+     * you collide with, and a pack author can reason about the collider by reading the file rather
+     * than by reading this class.
+     * <p>
+     * The one liberty taken is normalising min/max per axis, so an element written with {@code to}
+     * smaller than {@code from} on some axis still yields a real box instead of an inverted,
+     * zero-volume one. That is repairing a malformed element, not reinterpreting a valid one.
+     *
+     * <h2>Why {@code "rotation"} is not applied</h2>
+     * A {@link VoxelShape} is a union of axis-aligned boxes; there is no such thing as a rotated
+     * one. Honouring an element's rotate gizmo therefore cannot reproduce the rotated part - the
+     * closest possible is the axis-aligned BOUNDING box of the rotated corners, which is strictly
+     * BIGGER than what the file says, growing a 45-degree part by up to ~40% on two axes. That was
+     * tried, and it makes the collider visibly larger than the model rather than matching it.
+     * Taking the element as written keeps the boxes the size the author drew them.
+     * <p>
+     * The consequence is honest and worth knowing: a rotated element collides at the position it
+     * occupies BEFORE its rotation. A model built mostly from rotated parts will have a collider
+     * that does not follow its visible geometry, and the fix is to draw the collisions json (which
+     * need not be the same file as the model) from axis-aligned boxes.
      */
     private static List<AABB> toBoxes(@Nullable CollisionModel model) {
         List<AABB> boxes = new ArrayList<>();
@@ -124,18 +175,13 @@ public class PowerPackLoaderCollisionLoader extends SimpleJsonResourceReloadList
             if (element == null || element.from == null || element.to == null
                     || element.from.length != 3 || element.to.length != 3) continue;
 
-            double minX = Math.min(element.from[0], element.to[0]) / 16.0;
-            double minY = Math.min(element.from[1], element.to[1]) / 16.0;
-            double minZ = Math.min(element.from[2], element.to[2]) / 16.0;
-            double maxX = Math.max(element.from[0], element.to[0]) / 16.0;
-            double maxY = Math.max(element.from[1], element.to[1]) / 16.0;
-            double maxZ = Math.max(element.from[2], element.to[2]) / 16.0;
-
-            // Per-element "rotation" (Blockbench's cube-rotation gizmo) is deliberately ignored:
-            // a VoxelShape box has to stay axis-aligned, and this is a collision box, not a
-            // render element - a pack author who wants a rotated-looking collider should just
-            // draw that element axis-aligned in the collisions model to begin with.
-            boxes.add(new AABB(minX, minY, minZ, maxX, maxY, maxZ));
+            boxes.add(new AABB(
+                    Math.min(element.from[0], element.to[0]) / 16.0,
+                    Math.min(element.from[1], element.to[1]) / 16.0,
+                    Math.min(element.from[2], element.to[2]) / 16.0,
+                    Math.max(element.from[0], element.to[0]) / 16.0,
+                    Math.max(element.from[1], element.to[1]) / 16.0,
+                    Math.max(element.from[2], element.to[2]) / 16.0));
         }
         return boxes;
     }

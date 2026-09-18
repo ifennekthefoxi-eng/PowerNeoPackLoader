@@ -106,11 +106,38 @@ overwrite the other's.
 ### The meta file
 
 ```json
-{ "name": "My Pack", "id": "my_pack" }
+{ "name": "My Pack", "id": "my_pack", "extend_original": false }
 ```
 
 A folder without one is not a pack and is skipped. Give each loader its own meta filename (e.g.
 `engine.meta.json`) if your mod runs several, so a pack can't be picked up by the wrong one.
+
+**`extend_original`** (optional, default false) declares the pack to be part of the mod's own
+content rather than an addition beside it. Its blocks then register as `<modId>:<blockId>` — no pack
+prefix.
+
+That is how a mod moves a block it used to register in Java into a pack **without changing its
+id**, so existing worlds, recipes, tags and loot tables keep working: as far as the game is
+concerned it is the same block it always was. Remove the Java registration when you do this —
+the library cannot see it (nothing is in the block registry yet while packs are being read), so
+leaving both in place is a duplicate-registration crash.
+
+### Name collisions
+
+A pack block never overwrites one that already exists. The name falls through:
+
+1. `<blockId>` — only tried for an `extend_original` pack
+2. `<packId>_<blockId>` — the ordinary name
+3. `<packId>_<blockId>_1`, `_2`, `_3`, … — counting up until one is free
+
+Every candidate is tested by the same rule, including names that are themselves a previous
+fallback, so the chain can't dead-end. Two packs both extending the original with a `v8_engine`
+give `v8_engine` to whichever is read first and `otherpack_v8_engine` to the second; a pack whose
+own prefixed name happens to be `otherpack_v8_engine` then gets `otherpack_v8_engine_1`. Anything
+past step 1 is logged as a warning naming both packs.
+
+"Already taken" means taken by another **pack block**. Blocks a mod registers by other means aren't
+visible at that point — see `extend_original` above.
 
 ### A block definition
 
@@ -119,6 +146,7 @@ A folder without one is not a pack and is skipped. Give each loader its own meta
   "name": "V8 Engine",
   "class": "MyEngineBlock",
   "geckolib": false,
+  "directional": true,
 
   "properties": {
     "strength": 4.0,
@@ -145,7 +173,12 @@ A folder without one is not a pack and is skipped. Give each loader its own meta
 }
 ```
 
-Only `class` is required. Everything in `properties` is optional and falls back to the loader's
+Only `class` is required. `directional` forces `facing=` variants on or off in the generated
+blockstate; left out, the library looks for vanilla's `HORIZONTAL_FACING` property on the block
+class (including inherited), which catches blocks that have it without extending
+`HorizontalDirectionalBlock` — most modded machine base classes, Create's included.
+
+Everything in `properties` is optional and falls back to the loader's
 defaults (`strength 2.0/3.0`, `light 0`, `no_occlusion` and `dynamic_shape` on). `sound` and
 `map_color` accept any vanilla `SoundType` / `MapColor` constant name, case-insensitively; an
 unrecognised one warns and keeps the default rather than crashing.
@@ -227,6 +260,25 @@ nothing.
 
 Renderer classes may be client-only: the library reads the annotation from NeoForge's scan data as a
 string and only resolves it on the client.
+
+### Optional dependencies
+
+If a block class touches another mod **anywhere — including inside a method body** — declare it:
+
+```java
+@PackBlock(requiredMods = "geckolib", entity = MyGeoBlockEntity.class)
+public class MyGeoBlock extends Block implements EntityBlock { ... }
+```
+
+The class is then skipped entirely when that mod is absent, and a pack json naming it logs the
+ordinary "unknown block class" error, so the rest of the pack still loads.
+
+Declaring it matters more than it looks. The library can load such a class fine — resolving a class
+doesn't run its method bodies — but the JVM *verifies* a class the first time it is instantiated,
+and verification resolves the types its methods mention in order to type-check them. So a block that
+merely returns `new MyGeoBlockEntity(...)` from `newBlockEntity` throws `NoClassDefFoundError` from
+inside the registry event, which FML reports as a fatal error that takes **the whole game** down
+rather than that one block. `requiredMods` is the only point early enough to avoid that.
 
 ---
 
@@ -383,6 +435,7 @@ other mod.
 | `PowerPackLoaderApi` | Entry point — `load(modId, bus)` and `loader(modId, bus)` |
 | `PackLoaderBuilder` | Per-loader settings |
 | `@PackBlock` | Marks a block class as loadable from packs |
+| `@PackBlock(requiredMods = ...)` | Skip a class unless those mods are loaded |
 | `@PackBlockEntity` / `@PackBlockItem` / `@PackRenderer` | Standalone forms of `@PackBlock`'s members |
 | `PackBlockContext` | A block's pack identity and its own JSON |
 | `PowerPackLoaderRegistry` | Look up what was registered |

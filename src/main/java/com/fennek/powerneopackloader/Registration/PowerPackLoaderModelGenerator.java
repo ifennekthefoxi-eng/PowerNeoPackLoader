@@ -2,9 +2,14 @@ package com.fennek.powerneopackloader.Registration;
 
 import com.fennek.powerneopackloader.PowerNeoPackLoader;
 import com.fennek.powerneopackloader.loadingPacks.PowerPackLoaderPacksLoader;
+import com.google.gson.JsonObject;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.level.block.state.properties.Property;
 import net.minecraft.world.level.block.HorizontalDirectionalBlock;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -123,6 +128,13 @@ public final class PowerPackLoaderModelGenerator {
     public static void generate(PowerPackLoaderPacksLoader loader, String modId, Path packFolder,
                                  String packId, String blockId, String registryName, Class<?> blockClass,
                                  boolean isGeckoLib, boolean isGeckoLibItem) {
+        generate(loader, modId, packFolder, packId, blockId, registryName, blockClass, isGeckoLib, isGeckoLibItem, null);
+    }
+
+    /** @param definition the block's json, read for the optional {@code "directional"} override. */
+    public static void generate(PowerPackLoaderPacksLoader loader, String modId, Path packFolder,
+                                 String packId, String blockId, String registryName, Class<?> blockClass,
+                                 boolean isGeckoLib, boolean isGeckoLibItem, JsonObject definition) {
         Path packAssets = packFolder.resolve("assets").resolve(packId);
         Path modelsFolder = packAssets.resolve("models");
         boolean hasBlockModel = Files.isRegularFile(modelsFolder.resolve("block").resolve(blockId + ".json"));
@@ -163,7 +175,7 @@ public final class PowerPackLoaderModelGenerator {
             copyFile(packBlockState, blockstateTarget);
         } else if (hasBlockModel) {
             writeJson(blockstateTarget, buildBlockState(packId + ":block/" + blockId,
-                    !isGeckoLib && HorizontalDirectionalBlock.class.isAssignableFrom(blockClass)));
+                    !isGeckoLib && isHorizontallyDirectional(blockClass, definition)));
         } else if (isGeckoLib) {
             // SECONDARY PIPELINE for GeckoLib blocks: without this branch, a GeckoLib block that
             // ships no baked model (the normal case - see above) fell all the way through to the
@@ -224,18 +236,76 @@ public final class PowerPackLoaderModelGenerator {
         // models/item/<blockId>.json their custom blockstate needs; nothing here can guess it.
     }
 
+    /**
+     * Whether the auto-generated blockstate should carry {@code facing=} variants.
+     * <p>
+     * A pack can settle it outright with {@code "directional": true|false} in the block json. With
+     * nothing declared, this looks for vanilla's {@code HORIZONTAL_FACING} property among the
+     * class's public static fields, inherited ones included.
+     * <p>
+     * It controls the generated BLOCKSTATE, not the block. Set it to {@code false} for a block
+     * whose visible body is drawn by its own {@code BlockEntityRenderer} rather than by the chunk
+     * mesh: that renderer rotates the model itself, and a rotating blockstate on top of it applies
+     * the rotation twice. With Create-style renderers the two happen to cancel out exactly, so the
+     * block silently stops rotating at all rather than looking obviously wrong.
+     * <p>
+     * Checking the property rather than the class hierarchy matters: {@code instanceof
+     * HorizontalDirectionalBlock} - the obvious test, and the only one this used to do - is false
+     * for a great many blocks that are horizontally directional anyway, because plenty of mod base
+     * classes add {@code HORIZONTAL_FACING} while extending plain {@code Block}. Create's
+     * {@code HorizontalKineticBlock} is one, so every Create-style machine silently generated a
+     * single-variant blockstate and rendered facing north no matter which way it was placed.
+     * <p>
+     * Reflection over fields, not over a block instance, because no block exists yet: generation
+     * runs while the pack folder is being scanned, before anything is constructed.
+     */
+    private static boolean isHorizontallyDirectional(Class<?> blockClass, JsonObject definition) {
+        if (definition != null && definition.has("directional") && !definition.get("directional").isJsonNull()) {
+            return definition.get("directional").getAsBoolean();
+        }
+
+        if (HorizontalDirectionalBlock.class.isAssignableFrom(blockClass)) {
+            return true;
+        }
+
+        for (Field field : blockClass.getFields()) {
+            if (!Modifier.isStatic(field.getModifiers()) || !Property.class.isAssignableFrom(field.getType())) {
+                continue;
+            }
+            try {
+                if (field.get(null) == BlockStateProperties.HORIZONTAL_FACING) {
+                    return true;
+                }
+            } catch (IllegalAccessException ignored) {
+                // A non-accessible static - nothing to learn from it, keep looking.
+            }
+        }
+        return false;
+    }
+
     /** @param model the full "namespace:block/path" model reference the blockstate should point
      *               at - already fully built by the caller, since the two callers now source it
      *               from different namespaces (the pack's, for a pack-supplied model; this mod's
      *               own, for the auto-generated invisible GeckoLib model). */
     private static String buildBlockState(String model, boolean directional) {
         if (directional) {
+            // SOUTH is the identity orientation: a model json is drawn as the block looks facing
+            // south, and each variant's rotation is simply that facing's own Direction#toYRot()
+            // (south 0, west 90, north 180, east 270).
+            //
+            // Vanilla's own blockstates use NORTH as identity, but this library cannot follow that:
+            // its collision loader reads the SAME KIND of json and has always treated it as
+            // south-facing, so a north-baseline blockstate leaves every block's visible model 180
+            // degrees away from its own collision box. Agreeing with the collider matters far more
+            // than matching vanilla's arbitrary pick - a pack author draws one shape and expects
+            // the collision to sit on it. See PowerPackLoaderCollisionLoader#rotateHorizontal,
+            // which is the other half of this convention.
             return "{\n"
                     + "  \"variants\": {\n"
-                    + "    \"facing=north\": { \"model\": \"" + model + "\" },\n"
-                    + "    \"facing=east\":  { \"model\": \"" + model + "\", \"y\": 90 },\n"
-                    + "    \"facing=south\": { \"model\": \"" + model + "\", \"y\": 180 },\n"
-                    + "    \"facing=west\":  { \"model\": \"" + model + "\", \"y\": 270 }\n"
+                    + "    \"facing=south\": { \"model\": \"" + model + "\" },\n"
+                    + "    \"facing=west\":  { \"model\": \"" + model + "\", \"y\": 90 },\n"
+                    + "    \"facing=north\": { \"model\": \"" + model + "\", \"y\": 180 },\n"
+                    + "    \"facing=east\":  { \"model\": \"" + model + "\", \"y\": 270 }\n"
                     + "  }\n"
                     + "}\n";
         }

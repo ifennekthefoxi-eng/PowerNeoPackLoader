@@ -12,8 +12,12 @@ import com.fennek.powerneopackloader.loadingPacks.GetJarResources;
 import com.fennek.powerneopackloader.loadingPacks.PowerPackLoaderPacksLoader;
 import net.minecraft.server.packs.PackType;
 import net.neoforged.bus.api.IEventBus;
+import net.neoforged.fml.ModList;
 import net.neoforged.fml.loading.FMLLoader;
+import net.neoforged.neoforgespi.language.IModFileInfo;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -186,8 +190,13 @@ public class PackLoaderBuilder {
         PackType packType = FMLLoader.getDist().isClient() ? PackType.CLIENT_RESOURCES : PackType.SERVER_DATA;
         PowerPackLoaderPacksLoader loader = new PowerPackLoaderPacksLoader(packType, folder, modId, metaFileName);
 
-        for (String packName : resolveDefaultPackNames()) {
-            loader.addDefaultResource(resourceOwner, String.format("/assets/%s/default_packs/%s", modId, packName), packName);
+        Path defaultPacksRoot = defaultPacksRoot();
+        for (String packName : resolveDefaultPackNames(defaultPacksRoot)) {
+            if (defaultPacksRoot != null) {
+                loader.addDefaultResource(defaultPacksRoot.resolve(packName), packName);
+            } else {
+                loader.addDefaultResource(resourceOwner, String.format("/assets/%s/default_packs/%s", modId, packName), packName);
+            }
         }
         // Extract now, during mod construction, rather than leaving it to the pack repository
         // scan: the block registration below reads these folders off disk immediately.
@@ -202,21 +211,50 @@ public class PackLoaderBuilder {
         return loader;
     }
 
+    /**
+     * This mod's {@code assets/<modId>/default_packs} directory, resolved through NeoForge's own
+     * mod-file lookup, or null if the mod ships none.
+     * <p>
+     * Deliberately NOT {@code Class#getResource}: that returns null for a DIRECTORY resource when a
+     * mod is loaded from exploded directories instead of a jar, which is exactly how every mod is
+     * loaded in a dev workspace. Default packs therefore extracted perfectly from a built jar and
+     * silently not at all in dev - the mod registered no blocks and said nothing about why.
+     * {@code IModFile#findResource} gives a real {@link Path} in both cases (a zip filesystem path
+     * for a jar), so the two stop differing.
+     */
+    private Path defaultPacksRoot() {
+        IModFileInfo info = ModList.get().getModFileById(modId);
+        if (info == null || info.getFile() == null) {
+            return null;
+        }
+        try {
+            Path root = info.getFile().findResource("assets", modId, "default_packs");
+            return Files.isDirectory(root) ? root : null;
+        } catch (Exception e) {
+            PowerNeoPackLoader.LOGGER.debug("No default_packs directory for '{}': {}", modId, e.getMessage());
+            return null;
+        }
+    }
+
     /** The explicitly named default packs, or - when none were named - every folder the mod ships
      *  under {@code assets/<modId>/default_packs/}. */
-    private List<String> resolveDefaultPackNames() {
+    private List<String> resolveDefaultPackNames(Path defaultPacksRoot) {
         if (defaultPackNames != null) {
             return defaultPackNames;
         }
-        if (resourceOwner == null) {
-            PowerNeoPackLoader.LOGGER.warn(
-                    "No resource owner class for '{}' - skipping default pack extraction. "
-                            + "Call resourcesFrom(YourMod.class) if this mod ships default packs.", modId);
-            return List.of();
+
+        List<String> discovered = defaultPacksRoot != null
+                ? new ArrayList<>(GetJarResources.listChildDirectories(defaultPacksRoot))
+                : new ArrayList<>();
+
+        // Fall back to the classloader route for anything the mod-file lookup couldn't see.
+        if (discovered.isEmpty() && resourceOwner != null) {
+            discovered.addAll(GetJarResources.listChildDirectories(resourceOwner, "/assets/" + modId + "/default_packs"));
         }
-        List<String> discovered = new ArrayList<>(
-                GetJarResources.listChildDirectories(resourceOwner, "/assets/" + modId + "/default_packs"));
-        if (!discovered.isEmpty()) {
+
+        if (discovered.isEmpty()) {
+            PowerNeoPackLoader.LOGGER.info("Mod '{}' ships no default packs.", modId);
+        } else {
             PowerNeoPackLoader.LOGGER.info("Found {} default pack(s) shipped by '{}': {}", discovered.size(), modId, discovered);
         }
         return discovered;

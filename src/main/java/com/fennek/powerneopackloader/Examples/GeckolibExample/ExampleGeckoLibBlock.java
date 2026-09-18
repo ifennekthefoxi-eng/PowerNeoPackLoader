@@ -35,6 +35,11 @@ import java.util.function.Supplier;
  * while this block itself - which extends nothing but vanilla {@code Block} - still registers.
  */
 @PackBlock(
+        // Without this the block still registers on an install lacking GeckoLib, and then dies
+        // inside the registry event when the JVM verifies newBlockEntity() below and resolves
+        // ExampleGeckoLibBlockEntity's GeoBlockEntity supertype - a fatal mod-loading error for
+        // every mod in the game, not just this example. See @PackBlock#requiredMods.
+        requiredMods = "geckolib",
         entity = ExampleGeckoLibBlockEntity.class,
         item = ExampleGeckoLibBlockItem.class,
         renderer = ExampleGeckoLibBlockRenderer.class)
