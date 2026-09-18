@@ -187,6 +187,34 @@ Any other field — `power` above — is yours, read through `PackBlockContext`.
 
 ---
 
+## Collision shapes
+
+`data/<packId>/collisions/<blockId>.json` is a block-model json — the same format as the model, so
+the model file itself can be used. Only `elements` are read; textures, faces and display are
+ignored. With no file, the block gets a full cube.
+
+* **An unrotated element** becomes exactly the box its `from`/`to` describe, ÷16. Nothing inferred,
+  expanded or snapped — reading the json tells you what you collide with.
+* **A rotated element is rasterized.** A `VoxelShape` is a union of *axis-aligned* boxes; a rotated
+  one does not exist. Ignoring the rotation leaves the box where the part was *before* it turned,
+  and using the bounding box of the rotated corners is ~40% too big on two axes at 45°. So the
+  block is divided into a voxel grid, every cell the rotated part actually overlaps is filled, and
+  the filled cells are merged back into as few boxes as possible — the same thing a renderer does
+  turning a triangle into pixels. Stair-stepped, but in the right place at the right size.
+* **Zero-thickness elements never collide** (`from` and `to` equal on some axis). They render as a
+  flat plane but enclose no volume, which is how vanilla treats them too.
+
+Overlap is computed exactly, not by sampling: an element rotates about one axis, so the test is an
+interval overlap along it plus a 2D separating-axis test in the plane. Sampling would drop parts
+thinner than a cell.
+
+`"collision_resolution": 16` in the block json sets the grid (default 16 — one cell per model unit,
+the granularity the model is drawn on; capped at 64). Higher is more faithful and produces more
+boxes.
+
+Each shape is logged on load with its box count and bounds, so you can tell a file that never
+loaded from one that loaded into a shape you didn't expect.
+
 ## Reading a block's own data
 
 Add a second constructor parameter and the library hands the block its definition:
